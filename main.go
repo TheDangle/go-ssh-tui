@@ -4,13 +4,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/user"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 // connectionsFilePath is the name of our file where we'll store connections.
@@ -80,7 +84,78 @@ type (
 	connectionsLoadedMsg []Connection
 	// state machine for our application views
 	state int
+	// sshConnectedMsg is returned when the ssh client is successfully created.
+	sshConnectedMsg *ssh.Client
+	// sshClientErrorMsg is returned if the connection fails.
+	sshClientErrorMsg error
 )
+
+const (
+	listView state = iota
+	formView
+	passwordPromptView
+	connectingView
+	shellView
+)
+
+// model is the main application state.
+// It holds our list of connections and the list component itself.
+type model struct {
+	connections       []Connection
+	list              list.Model
+	inputs            []textinput.Model
+	passwordInput     textinput.Model
+	state             state
+	focusIndex        int
+	currentConnection *Connection
+	shellOutput       string
+	err               error
+}
+
+// getHostKeyCallback is a security helper to load keys from the startdard known_hosts file.
+func getHostKeyCallback() (ssh.HostKeyCallback, error) {
+	usr, err := user.Current()
+	if err != nil {
+		return nil, fmt.Errorf("could not get current user home directory: %w", err)
+	}
+	knownHostsPath := fmt.Sprintf("%s/.ssh/known_hosts", usr.HomeDir)
+
+	// knownhosts.New handles reading teh file and creating the callback function.
+	hostKeyCallback, err := knownhosts.New(knownHostsPath)
+	if err != nil {
+		// this can fail if the file doesn't exist or is inaccessible.
+		return nil, fmt.Errorf("could not load known_hosts file from %s: %w", knownHostsPath, err)
+	}
+	return hostKeyCallback, nil
+}
+
+// is the command that attempts to dial and auth the ssh connection.
+func connectToSSH(conn Connection, password string) tea.Cmd {
+	return func() tea.Msg {
+		hostKeyCallback, err := getHostKeyCallback()
+		if err != nil {
+			return sshClientErrorMsg(fmt.Errorf("security steup error: %w", err))
+		}
+
+		config := &ssh.ClientConfig{
+			User: conn.User,
+			Auth: []ssh.AuthMethod{
+				ssh.Password(password),
+			},
+			// use the secure callback.
+			HostKeyCallback: hostKeyCallback,
+			Timeout:         5 * time.Second,
+		}
+
+		addr := fmt.Sprintf("%s:%d", conn.Host, conn.Port)
+		client, err := ssh.Dial("tcp", addr, config)
+		if err != nil {
+			// this is where common host key errors will appear.
+			return sshClientErrorMsg(fmt.Errorf("failed to dial or key mismatch: %w", err))
+		}
+		return sshConnectedMsg(client)
+	}
+}
 
 // loadConnectionsCmd is a command that loads our connections asynchronously.
 func loadConnectionsCmd() tea.Msg {
@@ -90,21 +165,6 @@ func loadConnectionsCmd() tea.Msg {
 		os.Exit(1)
 	}
 	return connectionsLoadedMsg(connections)
-}
-
-const (
-	listView state = iota
-	formView
-)
-
-// model is the main application state.
-// It holds our list of connections and the list component itself.
-type model struct {
-	connections []Connection
-	list        list.Model
-	inputs      []textinput.Model
-	state       state
-	focusIndex  int
 }
 
 // InitialModel returns the starting state of our TUI application.
@@ -137,11 +197,17 @@ func InitialModel() model {
 		inputs[i] = t
 	}
 
+	pInput := textinput.New()
+	pInput.EchoMode = textinput.EchoPassword
+	pInput.EchoCharacter = '*'
+	pInput.Placeholder = "SSH Password"
+
 	return model{
-		list:       l,
-		inputs:     inputs,
-		state:      listView,
-		focusIndex: 0,
+		list:          l,
+		inputs:        inputs,
+		passwordInput: pInput,
+		state:         listView,
+		focusIndex:    0,
 	}
 }
 
@@ -188,12 +254,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = listView
 		m.focusIndex = 0
 		return m, nil
+
+	case sshConnectedMsg:
+		m.state = shellView
+		m.shellOutput = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render(
+			fmt.Sprintf("Successfully connected to %s. (Client: %p)\nPress Ctrl+c to disconnect. Now preparing shell...\n",
+				m.currentConnection.Name, msg))
+		return m, nil
+
+	case sshClientErrorMsg:
+		m.state = listView
+		m.err = msg
+		return m, nil
 	}
+
 	switch m.state {
 	case listView:
 		return m.updateList(msg)
 	case formView:
 		return m.updateForm(msg)
+	case passwordPromptView:
+		return m.updatePasswordPrompt(msg)
 	}
 
 	return m, nil
@@ -212,6 +293,7 @@ func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			for i := range m.inputs {
 				m.inputs[i].SetValue("")
 			}
+			m.inputs[m.focusIndex].Focus()
 			return m, nil
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -219,8 +301,11 @@ func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Corrected from `selectedItem` to `SelectedItem`.
 			if len(m.list.Items()) > 0 {
 				selectedItem := m.list.SelectedItem().(item)
-				fmt.Printf("Connecting to: %s...\n", selectedItem.connection.Name)
-				return m, tea.Quit
+				m.currentConnection = selectedItem.connection
+				m.state = passwordPromptView
+				m.passwordInput.Focus()
+				m.passwordInput.SetValue("")
+				return m, nil
 			}
 		}
 	}
@@ -290,10 +375,40 @@ func (m model) updateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m model) updatePasswordPrompt(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "esc":
+			m.state = listView
+			m.passwordInput.Blur()
+			return m, nil
+		case "enter":
+			password := m.passwordInput.Value()
+			m.passwordInput.Blur()
+
+			m.state = connectingView
+			return m, connectToSSH(*m.currentConnection, password)
+		}
+	}
+
+	m.passwordInput, cmd = m.passwordInput.Update(msg)
+	return m, cmd
+}
+
 func (m model) View() string {
+	var s string
+	if m.err != nil {
+		s = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Render(fmt.Sprintf("ERROR: %v\n", m.err))
+		// we clear the error so it doesn't persist across successfull interactions
+		m.err = nil
+	}
+
 	switch m.state {
 	case listView:
-		return m.list.View()
+		s += m.list.View()
 	case formView:
 		var b strings.Builder
 		b.WriteString("Add a New Connection\n\n")
@@ -305,9 +420,19 @@ func (m model) View() string {
 			}
 		}
 		b.WriteString("\n\nPress Enter to save, Esc to go back.")
-		return b.String()
+		s += b.String()
+	case passwordPromptView:
+		var b strings.Builder
+		b.WriteString(fmt.Sprintf("Enter password for %s@%s: \n\n", m.currentConnection.User, m.currentConnection.Host))
+		b.WriteString(m.passwordInput.View())
+		b.WriteString("\n\nPress Enter to connect, Esc to cancel.")
+		s += b.String()
+	case connectingView:
+		s += fmt.Sprintf("Connecting to %s@%s:%d...", m.currentConnection.User, m.currentConnection.Host, m.currentConnection.Port)
+	case shellView:
+		s += m.shellOutput
 	}
-	return ""
+	return s
 }
 
 func main() {

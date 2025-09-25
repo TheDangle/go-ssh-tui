@@ -16,5 +16,35 @@
     "user": "root",
     "host": "127.0.0.1",
     "port": 22
+  },
+  {
+    "name": "test conn",
+    "user": "",
+    "host": "",
+    "port": 22
+  },
+  {
+    "name": "test conn",
+    "user": "root",
+    "host": "192.168.1.1",
+    "port": 22
+  },
+  {
+    "name": "new conn",
+    "user": "erangel",
+    "host": "172.16.0.1",
+    "port": 22
+  },
+  {
+    "name": "another test",
+    "user": "root",
+    "host": "192.168.1.2",
+    "port": 22
+  },
+  {
+    "name": "windows machine",
+    "user": "exr02171",
+    "host": "10.1.20.59",
+    "port": 22
   }
 ]
