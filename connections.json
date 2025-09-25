@@ -46,5 +46,53 @@
     "user": "exr02171",
     "host": "10.1.20.59",
     "port": 22
+  },
+  {
+    "name": "test",
+    "user": "test",
+    "host": "127.0.0.1",
+    "port": 22
+  },
+  {
+    "name": "test",
+    "user": "test",
+    "host": "tes",
+    "port": 22
+  },
+  {
+    "name": "test",
+    "user": "test",
+    "host": "test",
+    "port": 22
+  },
+  {
+    "name": "tes",
+    "user": "test",
+    "host": "test",
+    "port": 22
+  },
+  {
+    "name": "teat",
+    "user": "teat",
+    "host": "etaet",
+    "port": 22
+  },
+  {
+    "name": "df",
+    "user": "sadf",
+    "host": "safs",
+    "port": 22
+  },
+  {
+    "name": "ease",
+    "user": "easeas",
+    "host": "eaes",
+    "port": 22
+  },
+  {
+    "name": "ubuntu-vm",
+    "user": "erangel1",
+    "host": "10.1.20.60",
+    "port": 22
   }
 ]

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/user"
 	"strconv"
@@ -88,6 +89,10 @@ type (
 	sshConnectedMsg *ssh.Client
 	// sshClientErrorMsg is returned if the connection fails.
 	sshClientErrorMsg error
+	// data received from the remote shell
+	shellOutputMsg []byte
+	// session closed or error
+	shellExitMsg struct{ Err error }
 )
 
 const (
@@ -110,6 +115,16 @@ type model struct {
 	currentConnection *Connection
 	shellOutput       string
 	err               error
+	sshClient         *ssh.Client
+	sshSession        *ssh.Session
+	sshStdin          io.WriteCloser
+	sshStdout         io.Reader
+}
+
+type shellReadyMsg struct {
+	session *ssh.Session
+	stdin   io.WriteCloser
+	stdout  io.Reader
 }
 
 // getHostKeyCallback is a security helper to load keys from the startdard known_hosts file.
@@ -256,16 +271,77 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case sshConnectedMsg:
+		m.state = connectingView
+		m.sshClient = msg
+
+		return m, startShellCmd(m.sshClient, m.currentConnection)
+
+	case shellReadyMsg: // catch the new return type from startShellCmd
 		m.state = shellView
-		m.shellOutput = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render(
-			fmt.Sprintf("Successfully connected to %s. (Client: %p)\nPress Ctrl+c to disconnect. Now preparing shell...\n",
-				m.currentConnection.Name, msg))
+		m.sshSession = msg.session
+		m.sshStdin = msg.stdin
+		m.sshStdout = msg.stdout
+		m.shellOutput = "" // clear the success message
+
+		// now return the session is ready, start the continuous read loop.
+		return m, readShellCmd(m.sshStdout)
+
+	case shellOutputMsg:
+		// append new data to the output buffer and keep the read loop running
+		m.shellOutput += string(msg)
+		// important: the key to the continuous loop is returning the read command here.
+		return m, readShellCmd(m.sshStdout)
+
+	case shellExitMsg:
+		// shell closed, clean up and go back to list.
+		m.state = listView
+		m.err = msg.Err // display exit reason
+		if m.sshClient != nil {
+			m.sshClient.Close()
+		}
+		if m.sshSession != nil {
+			m.sshSession.Close()
+		}
+		m.sshClient = nil
+		m.sshSession = nil
+		m.currentConnection = nil
 		return m, nil
 
 	case sshClientErrorMsg:
 		m.state = listView
 		m.err = msg
 		return m, nil
+	}
+
+	// global key handler while in shell view.
+	if m.state == shellView {
+		if k, ok := msg.(tea.KeyMsg); ok {
+			// handle CTRL+Q to explicitely disconnect.
+			if k.String() == "ctrl+q" || k.String() == "ctrl+c" {
+				// send exit message to close the session gracefully.
+				m.sshSession.Close()
+				return m, tea.Quit
+			}
+
+			// send all other key presses to the remote shell's stdin.
+			if m.sshSession != nil && m.sshStdin != nil {
+				// write the eawy bytes of the key press to the remote session.
+				// for runes, we need to handle special cases like 'enter'.
+				if k.Type == tea.KeyRunes {
+					if _, err := m.sshStdin.Write([]byte(k.String())); err != nil {
+						return m, tea.Batch(tea.Quit, sendMsgCmd(shellExitMsg{Err: fmt.Errorf("failed to write to shell: %w", err)}))
+					}
+				} else if k.Type == tea.KeyEnter {
+					if _, err := m.sshStdin.Write([]byte{'\r'}); err != nil {
+						return m, tea.Batch(tea.Quit, sendMsgCmd(shellExitMsg{Err: fmt.Errorf("failed to write to shell: %w", err)}))
+					}
+				} else if k.Type == tea.KeySpace {
+					if _, err := m.sshStdin.Write([]byte{' '}); err != nil {
+						return m, tea.Batch(tea.Quit, sendMsgCmd(shellExitMsg{Err: fmt.Errorf("failed to write to shell: %w", err)}))
+					}
+				}
+			}
+		}
 	}
 
 	switch m.state {
@@ -433,6 +509,82 @@ func (m model) View() string {
 		s += m.shellOutput
 	}
 	return s
+}
+
+// readShellCmd is the command that reads output from the shell session.
+// it runs continuosly until the session closes or an error occurs.
+func readShellCmd(stdout io.Reader) tea.Cmd {
+	return func() tea.Msg {
+		// create a small buffer and read loop.
+		buf := make([]byte, 1024)
+		for {
+			n, err := stdout.Read(buf)
+			if n > 0 {
+				// send the data back to the TUI update loop.
+				return shellOutputMsg(append([]byte{}, buf[:n]...))
+			}
+			if err != nil {
+				// session closed or error occurred.
+				return shellExitMsg{Err: fmt.Errorf("shell session closed: %w", err)}
+			}
+		}
+	}
+}
+
+// startShellCmd is the command that sets up the PTY and starts the shell.
+func startShellCmd(c *ssh.Client, conn *Connection) tea.Cmd {
+	return func() tea.Msg {
+		session, err := c.NewSession()
+		if err != nil {
+			return shellExitMsg{Err: fmt.Errorf("failed to create session: %w", err)}
+		}
+		// 1. setup input: pipe TUI's input directly to the session's Stdin.
+		stdinPipe, err := session.StdinPipe()
+		if err != nil {
+			session.Close()
+			return shellExitMsg{Err: fmt.Errorf("failed to get stdin pipe: %w", err)}
+		}
+		// 4. setup output (StdoutPipe)
+		stdoutPipe, err := session.StdoutPipe()
+		if err != nil {
+			session.Close()
+			return shellExitMsg{Err: fmt.Errorf("failed to get stdout pipe: %w", err)}
+		}
+		// 2. request PTY (Psuedo-Terminal)
+		modes := ssh.TerminalModes{
+			ssh.ECHO:          1,     // enable enchoing.
+			ssh.TTY_OP_ISPEED: 14400, // input speed.
+			ssh.TTY_OP_OSPEED: 14400, // output speed.
+
+			ssh.ICRNL: 1,
+			ssh.ONLCR: 1,
+		}
+
+		// use a standard terminal type like "xterm" or "vt100"
+		if err := session.RequestPty("xterm", 80, 40, modes); err != nil {
+			session.Close()
+			return shellExitMsg{Err: fmt.Errorf("request for pty failed: %w", err)}
+		}
+
+		// 3. start the shell.
+		if err := session.Start("/bin/bash"); err != nil {
+			session.Close()
+			return shellExitMsg{Err: fmt.Errorf("failed to start shell: %w", err)}
+		}
+
+		// the shell is running. save the session and return a message to start reading output.
+		return shellReadyMsg{
+			session: session,
+			stdin:   stdinPipe,
+			stdout:  stdoutPipe,
+		}
+	}
+}
+
+func sendMsgCmd(msg tea.Msg) tea.Cmd {
+	return func() tea.Msg {
+		return msg
+	}
 }
 
 func main() {
