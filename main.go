@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -236,7 +237,61 @@ func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 // updateForm handles updates for the form view
 func (m model) updateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// placeholder
-	return m, nil
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "esc":
+			m.state = listView
+			return m, nil
+		case "enter":
+			// save the new connection and switch back to list view
+			port, err := strconv.Atoi(m.inputs[3].Value())
+			if err != nil {
+				port = 22 // default to port 22 if invalid.
+			}
+
+			newConn := Connection{
+				Name: m.inputs[0].Value(),
+				User: m.inputs[1].Value(),
+				Host: m.inputs[2].Value(),
+				Port: port,
+			}
+			// sace the new connection asynchronously.
+			return m, func() tea.Msg {
+				m.connections = append(m.connections, newConn)
+				err := saveConnections(m.connections)
+				if err != nil {
+					return tea.Quit
+				}
+				return connectionSavedMsg(newConn)
+			}
+		case "tab", "shift-tab", "down", "up":
+			s := msg.String()
+			if s == "up" || s == "shift+tab" {
+				m.focusIndex--
+			} else {
+				m.focusIndex++
+			}
+			// wrap the focus index.
+			if m.focusIndex < 0 {
+				m.focusIndex = len(m.inputs) - 1
+			} else if m.focusIndex >= len(m.inputs) {
+				m.focusIndex = 0
+			}
+
+			// blur all inputs.
+			for i := range m.inputs {
+				m.inputs[i].Blur()
+			}
+
+			// focus the current input.
+			m.inputs[m.focusIndex].Focus()
+		}
+	}
+
+	var cmd tea.Cmd
+	m.inputs[m.focusIndex], cmd = m.inputs[m.focusIndex].Update(msg)
+	return m, cmd
 }
 
 func main() {
