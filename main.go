@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -198,11 +199,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// View returns the string representation of our application's current state.
-func (m model) View() string {
-	return m.list.View()
-}
-
 func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
@@ -292,6 +288,26 @@ func (m model) updateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.inputs[m.focusIndex], cmd = m.inputs[m.focusIndex].Update(msg)
 	return m, cmd
+}
+
+func (m model) View() string {
+	switch m.state {
+	case listView:
+		return m.list.View()
+	case formView:
+		var b strings.Builder
+		b.WriteString("Add a New Connection\n\n")
+
+		for i, input := range m.inputs {
+			b.WriteString(input.View())
+			if i < len(m.inputs)-1 {
+				b.WriteString("\n")
+			}
+		}
+		b.WriteString("\n\nPress Enter to save, Esc to go back.")
+		return b.String()
+	}
+	return ""
 }
 
 func main() {
