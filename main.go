@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -63,6 +66,20 @@ func saveConnections(connections []Connection) error {
 	return nil
 }
 
+// deleteConnection removes a connection by name and saves the updated list.
+func deleteConnection(connections []Connection, name string) ([]Connection, error) {
+	var updatedConnections []Connection
+	for _, conn := range connections {
+		if conn.Name != name {
+			updatedConnections = append(updatedConnections, conn)
+		}
+	}
+	if err := saveConnections(updatedConnections); err != nil {
+		return nil, err
+	}
+	return updatedConnections, nil
+}
+
 // --- TUI-specific code starts here ---
 
 // item is a struct that satisfies the list.Item interface.
@@ -93,6 +110,8 @@ type (
 	shellOutputMsg []byte
 	// session closed or error
 	shellExitMsg struct{ Err error }
+
+	connectionDeletedMsg struct{ name string }
 )
 
 const (
@@ -118,7 +137,10 @@ type model struct {
 	sshClient         *ssh.Client
 	sshSession        *ssh.Session
 	sshStdin          io.WriteCloser
+	sshStdinBuf       *bufio.Writer
 	sshStdout         io.Reader
+	termWidth         int
+	termHeight        int
 }
 
 type shellReadyMsg struct {
@@ -240,6 +262,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// When the window resizes, we adjust the list component's dimensions.
 		m.list.SetWidth(msg.Width)
 		m.list.SetHeight(msg.Height - 1)
+
+		m.termWidth = msg.Width
+		m.termHeight = msg.Height
 		return m, nil
 
 	case connectionsLoadedMsg:
@@ -254,6 +279,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				connection:  &conn,
 			}
 		}
+		m.list.SetItems(items)
+		return m, nil
 	case connectionSavedMsg:
 		// when a connection is saved, we add it to our list and switch back to the list view.
 		m.connections = append(m.connections, Connection(msg))
@@ -270,17 +297,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.focusIndex = 0
 		return m, nil
 
+	case connectionDeletedMsg:
+		return m, loadConnectionsCmd
+
 	case sshConnectedMsg:
 		m.state = connectingView
 		m.sshClient = msg
 
-		return m, startShellCmd(m.sshClient, m.currentConnection)
+		return m, startShellCmd(m.sshClient, m.currentConnection, m.termWidth, m.termHeight)
 
 	case shellReadyMsg: // catch the new return type from startShellCmd
 		m.state = shellView
 		m.sshSession = msg.session
 		m.sshStdin = msg.stdin
 		m.sshStdout = msg.stdout
+		m.sshStdinBuf = bufio.NewWriter(m.sshStdin)
 		m.shellOutput = "" // clear the success message
 
 		// now return the session is ready, start the continuous read loop.
@@ -327,21 +358,39 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.sshSession != nil && m.sshStdin != nil {
 				// write the eawy bytes of the key press to the remote session.
 				// for runes, we need to handle special cases like 'enter'.
-				if k.Type == tea.KeyRunes {
-					if _, err := m.sshStdin.Write([]byte(k.String())); err != nil {
-						return m, tea.Batch(tea.Quit, sendMsgCmd(shellExitMsg{Err: fmt.Errorf("failed to write to shell: %w", err)}))
+				var inputBytes []byte
+
+				// Check for specific control/special keys
+				switch k.Type {
+				case tea.KeyEnter:
+					inputBytes = []byte{'\r'} // Send Carriage Return
+				case tea.KeyRunes:
+					inputBytes = []byte(string(k.Runes)) // Use Runes directly for efficiency and completeness
+				case tea.KeyBackspace, tea.KeyTab:
+					// Rely on k.String() for correct control sequence translation
+					inputBytes = []byte(k.String())
+				case tea.KeySpace:
+					inputBytes = []byte{' '}
+				default:
+					// Catch all other keys (like arrow keys, function keys, Ctrl+L, etc.)
+					// Note: Some complex keys might require termbox/tcell conversion, but this covers most
+					if len(k.String()) > 0 {
+						inputBytes = []byte(k.String())
 					}
-				} else if k.Type == tea.KeyEnter {
-					if _, err := m.sshStdin.Write([]byte{'\r'}); err != nil {
-						return m, tea.Batch(tea.Quit, sendMsgCmd(shellExitMsg{Err: fmt.Errorf("failed to write to shell: %w", err)}))
+				}
+
+				if len(inputBytes) > 0 {
+					if _, err := m.sshStdinBuf.Write(inputBytes); err != nil {
+						return m, sendMsgCmd(shellExitMsg{Err: fmt.Errorf("failed to write to shell: %w", err)})
 					}
-				} else if k.Type == tea.KeySpace {
-					if _, err := m.sshStdin.Write([]byte{' '}); err != nil {
-						return m, tea.Batch(tea.Quit, sendMsgCmd(shellExitMsg{Err: fmt.Errorf("failed to write to shell: %w", err)}))
+
+					if err := m.sshStdinBuf.Flush(); err != nil {
+						return m, sendMsgCmd(shellExitMsg{Err: fmt.Errorf("failed to flush input: %w", err)})
 					}
 				}
 			}
 		}
+		return m, nil
 	}
 
 	switch m.state {
@@ -371,8 +420,10 @@ func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.inputs[m.focusIndex].Focus()
 			return m, nil
+
 		case "q", "ctrl+c":
 			return m, tea.Quit
+
 		case "enter":
 			// Corrected from `selectedItem` to `SelectedItem`.
 			if len(m.list.Items()) > 0 {
@@ -383,6 +434,23 @@ func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.passwordInput.SetValue("")
 				return m, nil
 			}
+
+		case "d":
+			if len(m.list.Items()) > 0 {
+				// get the selected connectin's name.
+				selectedItem := m.list.SelectedItem().(item)
+				connName := selectedItem.connection.Name
+
+				// execute the deletion command.
+				return m, func() tea.Msg {
+					_, err := deleteConnection(m.connections, connName)
+					if err != nil {
+						return tea.Quit
+					}
+					return connectionDeletedMsg{name: connName}
+				}
+			}
+			return m, nil
 		}
 	}
 	// Pass any other messages (like navigation keys) to the list component.
@@ -520,10 +588,15 @@ func readShellCmd(stdout io.Reader) tea.Cmd {
 		for {
 			n, err := stdout.Read(buf)
 			if n > 0 {
+				data := buf[:n]
+				cleanData := bytes.ReplaceAll(data, []byte{'\r'}, []byte{})
 				// send the data back to the TUI update loop.
-				return shellOutputMsg(append([]byte{}, buf[:n]...))
+				return shellOutputMsg(append([]byte{}, cleanData...))
 			}
 			if err != nil {
+				if err == io.EOF {
+					return shellExitMsg{Err: errors.New("shell session closed (EOF)")}
+				}
 				// session closed or error occurred.
 				return shellExitMsg{Err: fmt.Errorf("shell session closed: %w", err)}
 			}
@@ -532,7 +605,7 @@ func readShellCmd(stdout io.Reader) tea.Cmd {
 }
 
 // startShellCmd is the command that sets up the PTY and starts the shell.
-func startShellCmd(c *ssh.Client, conn *Connection) tea.Cmd {
+func startShellCmd(c *ssh.Client, conn *Connection, width, height int) tea.Cmd {
 	return func() tea.Msg {
 		session, err := c.NewSession()
 		if err != nil {
@@ -552,22 +625,20 @@ func startShellCmd(c *ssh.Client, conn *Connection) tea.Cmd {
 		}
 		// 2. request PTY (Psuedo-Terminal)
 		modes := ssh.TerminalModes{
-			ssh.ECHO:          1,     // enable enchoing.
-			ssh.TTY_OP_ISPEED: 14400, // input speed.
-			ssh.TTY_OP_OSPEED: 14400, // output speed.
-
-			ssh.ICRNL: 1,
-			ssh.ONLCR: 1,
+			ssh.ECHO:   1, // enable enchoing.
+			ssh.ICANON: 1,
+			ssh.ISIG:   1,
+			ssh.ICRNL:  1,
 		}
 
 		// use a standard terminal type like "xterm" or "vt100"
-		if err := session.RequestPty("xterm", 80, 40, modes); err != nil {
+		if err := session.RequestPty("xterm-256color", height, width, modes); err != nil {
 			session.Close()
 			return shellExitMsg{Err: fmt.Errorf("request for pty failed: %w", err)}
 		}
 
 		// 3. start the shell.
-		if err := session.Start("/bin/bash"); err != nil {
+		if err := session.Shell(); err != nil {
 			session.Close()
 			return shellExitMsg{Err: fmt.Errorf("failed to start shell: %w", err)}
 		}
