@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/user"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -78,6 +79,12 @@ func deleteConnection(connections []Connection, name string) ([]Connection, erro
 		return nil, err
 	}
 	return updatedConnections, nil
+}
+
+var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+func stripANSI(s string) string {
+	return ansiRegex.ReplaceAllString(s, "")
 }
 
 // --- TUI-specific code starts here ---
@@ -336,7 +343,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sshClient = nil
 		m.sshSession = nil
 		m.currentConnection = nil
-		return m, nil
+		return m, tea.Quit
 
 	case sshClientErrorMsg:
 		m.state = listView
@@ -363,17 +370,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Check for specific control/special keys
 				switch k.Type {
 				case tea.KeyEnter:
-					inputBytes = []byte{'\r'} // Send Carriage Return
+					inputBytes = []byte{'\r'}
+
+				case tea.KeyBackspace:
+					// *** FIX: Send the standard delete character (ASCII 127) ***
+					inputBytes = []byte{127}
+
+				case tea.KeyUp:
+					// *** FIX: Send ANSI Up Arrow sequence ***
+					inputBytes = []byte{27, 91, 65} // ESC [ A
+
+				case tea.KeyDown:
+					// *** FIX: Send ANSI Down Arrow sequence ***
+					inputBytes = []byte{27, 91, 66} // ESC [ B
+
+				case tea.KeyRight:
+					// *** FIX: Send ANSI Right Arrow sequence ***
+					inputBytes = []byte{27, 91, 67} // ESC [ C
+
+				case tea.KeyLeft:
+					// *** FIX: Send ANSI Left Arrow sequence ***
+					inputBytes = []byte{27, 91, 68} // ESC [ D
+
 				case tea.KeyRunes:
-					inputBytes = []byte(string(k.Runes)) // Use Runes directly for efficiency and completeness
-				case tea.KeyBackspace, tea.KeyTab:
-					// Rely on k.String() for correct control sequence translation
-					inputBytes = []byte(k.String())
-				case tea.KeySpace:
-					inputBytes = []byte{' '}
+					inputBytes = []byte(string(k.Runes))
+
+				case tea.KeyTab:
+					inputBytes = []byte{'\t'}
+
 				default:
-					// Catch all other keys (like arrow keys, function keys, Ctrl+L, etc.)
-					// Note: Some complex keys might require termbox/tcell conversion, but this covers most
+					// Catch all other keys (like F-keys, Ctrl+L, etc.)
 					if len(k.String()) > 0 {
 						inputBytes = []byte(k.String())
 					}
@@ -574,6 +600,7 @@ func (m model) View() string {
 	case connectingView:
 		s += fmt.Sprintf("Connecting to %s@%s:%d...", m.currentConnection.User, m.currentConnection.Host, m.currentConnection.Port)
 	case shellView:
+		// 1. Get the raw output
 		s += m.shellOutput
 	}
 	return s
