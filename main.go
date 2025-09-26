@@ -22,6 +22,33 @@ import (
 	"golang.org/x/crypto/ssh/knownhosts"
 )
 
+// Define a simple color palette
+var (
+	colorAccent  = lipgloss.Color("#88C0D0") // Cyan for connection names/highlights
+	colorError   = lipgloss.Color("#BF616A") // Red for errors
+	colorSubtle  = lipgloss.Color("#4C566A") // Dark gray for status background
+	colorPrimary = lipgloss.Color("#D8DEE9") // Light gray/white for text
+)
+
+// Define the core styles
+var (
+	// Style for displaying errors
+	errorStyle = lipgloss.NewStyle().
+			Foreground(colorError).
+			Background(lipgloss.Color("#2E3440")). // Dark background for contrast
+			Padding(0, 1)
+
+	// Style for the bottom status bar
+	statusStyle = lipgloss.NewStyle().
+			Foreground(colorPrimary).
+			Background(colorSubtle).
+			Padding(0, 1)
+
+	// Style for the active shell view area (optional border/padding)
+	shellAreaStyle = lipgloss.NewStyle().
+			Padding(0, 1)
+)
+
 // connectionsFilePath is the name of our file where we'll store connections.
 const connectionsFilePath = "connections.json"
 
@@ -215,7 +242,7 @@ func loadConnectionsCmd() tea.Msg {
 func InitialModel() model {
 	// We create a new list component.
 	l := list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0)
-	l.Title = "SSH Connection Manager (press 'a' to add)"
+	l.Title = "SSH Connection Manager (press 'a' to add or 'd' to delete connections)"
 	l.SetShowStatusBar(false)
 	l.SetFilteringEnabled(false)
 
@@ -571,8 +598,8 @@ func (m model) updatePasswordPrompt(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) View() string {
 	var s string
 	if m.err != nil {
-		s = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Render(fmt.Sprintf("ERROR: %v\n", m.err))
 		// we clear the error so it doesn't persist across successfull interactions
+		s = errorStyle.Render(fmt.Sprintf("ERROR: %v\n", m.err))
 		m.err = nil
 	}
 
@@ -600,8 +627,30 @@ func (m model) View() string {
 	case connectingView:
 		s += fmt.Sprintf("Connecting to %s@%s:%d...", m.currentConnection.User, m.currentConnection.Host, m.currentConnection.Port)
 	case shellView:
-		// 1. Get the raw output
-		s += m.shellOutput
+		// 1. Build the status text
+		statusText := fmt.Sprintf("CONNECTED: %s@%s:%d",
+			m.currentConnection.User,
+			m.currentConnection.Host,
+			m.currentConnection.Port)
+
+		// 2. Render the status text using statusStyle
+		statusBar := statusStyle.
+			Width(m.termWidth). // Use stored width
+			Render(statusText)
+
+		// 3. Append to the final output with a newline separation
+		s += statusBar + "\n"
+
+		// The main shell content must be rendered beneath the status bar.
+		renderedShell := shellAreaStyle.
+			// Height is CRITICAL: Subtract 1 for the status bar and 1 for the separator newline
+			Height(m.termHeight - 2).
+			// Width remains m.termWidth - 2 (for padding/borders if you add them)
+			Width(m.termWidth).
+			Render(m.shellOutput)
+
+		s += renderedShell
+
 	}
 	return s
 }
@@ -612,8 +661,9 @@ func readShellCmd(stdout io.Reader) tea.Cmd {
 	return func() tea.Msg {
 		// create a small buffer and read loop.
 		buf := make([]byte, 1024)
+		n, err := stdout.Read(buf)
 		for {
-			n, err := stdout.Read(buf)
+
 			if n > 0 {
 				data := buf[:n]
 				cleanData := bytes.ReplaceAll(data, []byte{'\r'}, []byte{})
